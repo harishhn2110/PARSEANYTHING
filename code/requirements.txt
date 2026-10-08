@@ -1,0 +1,8 @@
+pytest==8.4.2
+fastapi==0.115.12
+uvicorn==0.34.0
+python-multipart==0.0.20
+sqlalchemy==2.0.40
+boto3==1.37.18
+pydantic-settings==2.8.1
+httpx==0.28.1

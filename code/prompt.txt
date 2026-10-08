@@ -1,0 +1,82 @@
+You are a senior engineer helping a student team build a hackathon MVP in a few hours. Build it phase by phase. After EACH phase, run it, fix errors, and tell me exactly how to run and test what exists. Never move on with broken code. Prefer simple, working code over clever code.
+
+PROJECT: ParseAnything, a universal document ingestion engine (DataQuest 3.0, problem DQCL, Cenizas Labs).
+It converts messy documents into structured Markdown + JSON where every block has a page number, bounding box, source method and confidence score. It must flag uncertain blocks instead of guessing text. Users are finance and legal teams, where one wrong table row is a critical error.
+
+STACK (Python 3.10+, runs locally, no paid services required for the core):
+- Streamlit UI
+- PyMuPDF (fitz) for PDF text, images and page rendering
+- pdfplumber for tables
+- pytesseract + Tesseract (with language packs) and Pillow/OpenCV for scans and images
+- python-docx, openpyxl, python-pptx for Office files
+- stdlib email for .eml
+- Optional LLM, used ONLY for the chat feature and chart/handwriting help, behind a single provider interface that reads an API key from an environment variable. If no key is set, the app must still run fully, with those features degrading gracefully.
+
+OUTPUT SCHEMA (define once in schema.py, never change it silently):
+Each block: {id, type: heading|paragraph|list|table|figure|equation|handwriting|header|footer|footnote, page, bbox:[x0,y0,x1,y1] in PDF points, reading_order, content (markdown text), data (e.g. table rows), confidence (0-1), source (pdf_text|ocr|table_extractor|office_parser|vision), lang, flagged (bool), flag_reason}.
+Document: {doc_id, filename, format, pages:[{page, width, height, blocks}], markdown, warnings, errors}.
+Error format: {error_code, message}. Codes: CORRUPT_FILE, UNSUPPORTED_FORMAT, ENCRYPTED_FILE, EMPTY_DOCUMENT, TIMEOUT, PARTIAL_FAILURE.
+Rule: never invent text. A block below the confidence threshold (default 0.6, configurable) is flagged with a reason, not "fixed".
+
+PHASE 1: Skeleton (get this working first)
+- Project layout: app/ (schema.py, detect.py, router.py, pipeline.py, errors.py, extractors/, features/), ui/streamlit_app.py, samples/, tests/, benchmark.py, requirements.txt, README.md.
+- detect.py: identify format from file header (magic bytes), not extension: PDF, DOCX, XLSX, PPTX, PNG/JPG, EML. Anything else returns UNSUPPORTED_FORMAT.
+- pipeline.parse(file_bytes, filename) is the single entry point. It wraps everything in a 60-second timeout and catches all exceptions, always returning a document or a structured error, never a crash.
+
+PHASE 2: Digital PDF
+- PyMuPDF text blocks with bboxes and font sizes.
+- Heading detection from font size relative to the page median.
+- Tag headers/footers by position (top/bottom ~7% of the page, repeated across pages) so they stay out of the body.
+- Multi-column reading order: cluster blocks by x-position into columns and order column by column, top to bottom.
+- Native text confidence ~0.95.
+
+PHASE 3: Scans and images (OCR)
+- Per page, if there is no usable text layer, render at 200 DPI, preprocess (grayscale, denoise, threshold) and run Tesseract with word-level confidence.
+- Group words into line/paragraph blocks, convert pixel coordinates back to PDF points, and use the mean word confidence as the block confidence.
+- Plain image files go through the same OCR path.
+
+PHASE 4: Tables
+- pdfplumber table extraction into rows/columns stored in block.data, rendered as a Markdown table in content.
+- Remove text blocks that duplicate content inside a table bbox.
+- Cross-page table merge: join a table at the bottom of page N with one at the top of page N+1 when the column count matches or the header row repeats. Record merged_from pages.
+- For scans, fall back to aligning OCR lines into rows by y-position and lower the confidence.
+
+PHASE 5: Office formats
+- DOCX: headings, paragraphs, lists, tables. XLSX: each sheet is a page, with the range as the location and each used range as a table. PPTX: each slide is a page, with shape position as bbox, tables read natively, native chart data read from the chart object, speaker notes as a block. EML: headers, body, attachment list.
+- For Office blocks, use confidence ~0.97 and bbox where available.
+
+PHASE 6: Flagging and failure handling
+- Flag blocks below threshold, very short or symbol-heavy OCR output, and tables with ragged rows. Always include flag_reason.
+- Add a document health report: pages, blocks, percent flagged, mean confidence per page, warnings.
+- Test with a corrupt file, an empty file, a password-protected PDF and an unsupported type; each must return the correct error code quickly.
+
+PHASE 7: Streamlit UI (important for the demo)
+- Upload file, call pipeline.parse, show the health report.
+- Left: the page image with colored bbox overlays by block type, flagged blocks in red, with a page selector and a confidence heatmap toggle.
+- Right: tabs for Markdown, JSON, Tables, and Flagged blocks.
+- Click-to-source: selecting a block in the list highlights its box on the page.
+- Download buttons for JSON, Markdown, and each table as CSV/Excel.
+
+PHASE 8: Additional features (build in this order; skip any that fail rather than shipping them broken)
+1. Table reconciliation checks: for numeric tables, verify column/row totals and quantity x price = total where such columns exist. Flag mismatches with the exact cells.
+2. Document chat with click-to-verify: build an index from the parsed blocks. Answer questions using ONLY block content, return the answer plus the cited block ids, and have the UI highlight those blocks on the page. If the answer is not in the blocks, say so. With an LLM key, use the LLM; without one, fall back to simple keyword/table-cell lookup.
+3. Review queue: a list of flagged blocks, each showing the cropped image beside the extracted text, with Approve and Edit buttons that update the output and mark the block as human-verified.
+4. Multi-language: let the user choose OCR languages, auto-detect the language per block (e.g. langdetect), store it in block.lang, and make sure UTF-8 text survives to Markdown/JSON.
+5. Handwriting with confidence failsafe: when OCR confidence is very low and the region looks handwritten, store it as a handwriting block, ALWAYS flagged, with the cropped image kept and any best-effort text marked as unverified.
+6. PII masking: regex detection for emails, phone numbers and ID-like numbers, with an option to mask them in the output.
+7. Charts: for figure blocks, crop the region. If a vision-capable LLM key is set, ask it for the underlying data as a JSON table and mark it "estimated" with lowered confidence; otherwise keep the cropped image and flag it. Never present chart values as exact.
+
+PHASE 9: Packaging and measurement
+- Dockerfile that installs Tesseract and runs the Streamlit app.
+- tests/: pytest tests for detection, error codes, reading order on a two-column sample, table merging and reconciliation.
+- benchmark.py: runs every file in samples/ through the pipeline and reports pages per second, time to error for bad files, percent of blocks with bbox and confidence, percent flagged, and, where I supply a ground-truth JSON/text for a sample, text similarity and table cell accuracy. Compare against a plain PyMuPDF get_text() baseline. Print a results table I can paste into my slides. Report only what is actually measured.
+- README: setup (including installing Tesseract and language packs), how to run the UI and tests, architecture diagram in text, and an honest list of what works and what does not.
+
+RULES
+- Do not claim a feature works unless you ran it. In the README and in your messages, label each feature as Working, Partial or Not built.
+- No fabricated metrics, accuracy numbers or sample results. If a sample file is missing, create small synthetic test files with reportlab/python-docx and say they are synthetic.
+- Keep dependencies minimal and pin versions in requirements.txt.
+- Each module should be small, readable and commented, so a first-year student can follow it.
+- If you hit a blocker (missing system package, library issue), pick the simplest workaround and tell me.
+
+START with Phase 1 now. When Phase 1 runs, show me the command to test it, then wait for me to say "next" before starting Phase 2.
